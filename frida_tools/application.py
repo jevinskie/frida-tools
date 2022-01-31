@@ -19,20 +19,9 @@ if platform.system() == 'Windows':
     import msvcrt
 
 import colorama
-# from colorama import Cursor, Fore, Style
-from colorama import Cursor
+from colorama import Cursor, Fore, Style
 import frida
 
-class Style:
-    BRIGHT = "[bold]"
-    RESET_ALL = ""
-
-class Fore:
-    GREEN = "[green]"
-    RED = "[red]"
-
-from rich import print
-from rich import inspect as rinspect
 
 AUX_OPTION_PATTERN = re.compile(r"(.+)=\((string|bool|int)\)(.+)")
 
@@ -80,22 +69,6 @@ def await_enter(reactor):
     except KeyboardInterrupt:
         print("")
 
-class ChildSummary:
-    def __init__(self, child):
-        self.pid = child.pid
-        self.parent_pid = child.parent_pid
-        self.origin = child.origin
-        self.path = child.path
-        self.argv = child.argv
-        self.orig_id = id(child)
-
-    def __rich_repr__(self):
-        yield "orig_id:", self.orig_id
-        yield "pid:", self.pid
-        yield "parent_pid:", self.parent_pid
-        yield "origin:", self.origin
-        yield "path:", self.path
-        yield "argv", self.argv, False
 
 class ConsoleState:
     EMPTY = 1
@@ -230,10 +203,13 @@ class ConsoleApplication(object):
             self._runtime = options.runtime
             self._enable_debugger = options.enable_debugger
             self._squelch_crash = options.squelch_crash
-            try:
-                self._child_gated_target = re.compile(options.await_child)
-            except re.error as e:
-                parser.error(f"Regular expression error parsing --await-child arg: '{options.await_child}' error: {e}")
+            if options.await_child is not None:
+                try:
+                    self._child_gated_target = re.compile(options.await_child)
+                except re.error as e:
+                    parser.error(f"Regular expression error parsing --await-child arg: '{options.await_child}' error: {e}")
+            else:
+                self._child_gated_target = None
         else:
             self._stdio = 'inherit'
             self._aux = []
@@ -529,11 +505,7 @@ class ConsoleApplication(object):
         thread.start()
 
     def _handle_child(self, child):
-        cs = ChildSummary(child)
-        print("_handle_child: ", cs)
-        # rinspect(child)
-        pid = child.pid
-        self._print(Fore.GREEN + Style.BRIGHT + "Handling child: " + str(cs) + Style.RESET_ALL)
+        self._print(Fore.GREEN + Style.BRIGHT + "Handling child: " + str(child.pid) + Style.RESET_ALL)
 
         if child.path is not None and child.argv is not None and \
                 self._child_gated_target.match(' '.join([child.path, *child.argv[1:]])):
@@ -558,19 +530,13 @@ class ConsoleApplication(object):
 
     def _on_child_handled(self, child):
         self._device.resume(child.pid)
-        pass
-        # raise NotImplementedError
-        # self._spawned_pid = spawn.pid
-        # self._start()
-        # self._started = True
 
     def _on_child_unhandled(self, child, error):
         self._update_status("Failed to handle child: %s" % error)
         self._exit(1)
 
     def _on_child_removed(self, child):
-        cs = ChildSummary(child)
-        print("_child_removed", cs)
+        print(f"_child_removed(pid={child.pid}")
 
     def _on_output(self, pid, fd, data):
         if pid != self._target_pid or data is None:
