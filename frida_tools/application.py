@@ -19,9 +19,20 @@ if platform.system() == 'Windows':
     import msvcrt
 
 import colorama
-from colorama import Cursor, Fore, Style
+# from colorama import Cursor, Fore, Style
+from colorama import Cursor
 import frida
 
+class Style:
+    BRIGHT = "[bold]"
+    RESET_ALL = ""
+
+class Fore:
+    GREEN = "[green]"
+    RED = "[red]"
+
+from rich import print
+from rich import inspect as rinspect
 
 AUX_OPTION_PATTERN = re.compile(r"(.+)=\((string|bool|int)\)(.+)")
 
@@ -69,6 +80,20 @@ def await_enter(reactor):
     except KeyboardInterrupt:
         print("")
 
+class ChildSummary:
+    def __init__(self, child):
+        self.pid = child.pid
+        self.parent_pid = child.parent_pid
+        self.origin = child.origin
+        self.path = child.path
+        self.argv = child.argv
+
+    def __rich_repr__(self):
+        yield "pid:", self.pid
+        yield "parent_pid:", self.parent_pid
+        yield "origin:", self.origin
+        yield "path:", self.path
+        yield "argv", self.argv, False
 
 class ConsoleState:
     EMPTY = 1
@@ -139,6 +164,8 @@ class ConsoleApplication(object):
                 type='int', action='callback', callback=store_target, callback_args=('pid',))
             parser.add_option("-W", "--await", help="await spawn matching PATTERN", metavar="PATTERN",
                 type='string', action='callback', callback=store_target, callback_args=('gated',))
+            parser.add_option("-C", "--await-child", help="await child process matching PATTERN", metavar="PATTERN",
+                type='string', action='store')
             parser.add_option("--stdio", help="stdio behavior when spawning (defaults to “inherit”)", metavar="inherit|pipe",
                 type='choice', choices=['inherit', 'pipe'], default='inherit')
             parser.add_option("--aux", help="set aux option when spawning, such as “uid=(int)42” (supported types are: string, bool, int)", metavar="option",
@@ -189,8 +216,8 @@ class ConsoleApplication(object):
         self._device = None
         self._schedule_on_output = lambda pid, fd, data: self._reactor.schedule(lambda: self._on_output(pid, fd, data))
         self._schedule_on_device_lost = lambda: self._reactor.schedule(self._on_device_lost)
-        self._spawned_pid = None
-        self._spawned_argv = None
+        self._spawned_pid = self._orig_spawned_pid = None
+        self._spawned_argv = self._orig_spawned_argv = None
         self._selected_spawn = None
         self._target_pid = None
         self._session = None
@@ -201,6 +228,10 @@ class ConsoleApplication(object):
             self._runtime = options.runtime
             self._enable_debugger = options.enable_debugger
             self._squelch_crash = options.squelch_crash
+            try:
+                self._child_gated_target = re.compile(options.await_child)
+            except re.error as e:
+                parser.error(f"Regular expression error parsing --await-child arg: '{options.await_child}' error: {e}")
         else:
             self._stdio = 'inherit'
             self._aux = []
@@ -208,6 +239,8 @@ class ConsoleApplication(object):
             self._runtime = 'qjs'
             self._enable_debugger = False
             self._squelch_crash = False
+            self._child_gated_target = None
+        self._child_sessions = set()
         self._schedule_on_session_detached = lambda reason, crash: self._reactor.schedule(lambda: self._on_session_detached(reason, crash))
         self._started = False
         self._resumed = False
@@ -393,6 +426,26 @@ class ConsoleApplication(object):
                     if not self._quiet:
                         self._update_status("Attaching...")
                 spawning = False
+                if self._child_gated_target:
+                    self._orig_spawned_pid = self._spawned_pid
+                    self._orig_spawned_argv = self._spawned_argv
+                    self._spawned_pid = None
+                    self._spawned_argv = None
+                    self._device.on('child-added', self._on_child_added)
+                    ses = self._device.attach(attach_target, realm=self._realm)
+                    self._child_sessions.add(ses)
+                    try:
+                        ses.enable_child_gating()
+                    except Exception as e:
+                        self._update_status(f"Failed to enable child gating: {e}")
+                        self._exit(1)
+                        return
+                    self._update_status("Waiting for child to appear...")
+                    print(ses)
+                    if self._orig_spawned_pid:
+                        self._device.resume(self._orig_spawned_pid)
+                    return
+
                 self._attach(attach_target)
             except frida.OperationCancelledError:
                 self._exit(0)
@@ -466,6 +519,49 @@ class ConsoleApplication(object):
 
     def _on_spawn_unhandled(self, spawn, error):
         self._update_status("Failed to handle spawn: %s" % error)
+        self._exit(1)
+
+    def _on_child_added(self, child):
+        thread = threading.Thread(target=self._handle_child, args=(child,))
+        thread.start()
+
+    def _handle_child(self, child):
+        cs = ChildSummary(child)
+        print("_handle_child: ", cs)
+        # rinspect(child)
+        pid = child.pid
+
+        # pattern = self._target[1]
+        # if pattern.match(spawn.identifier) is None or self._selected_spawn is not None:
+        #     self._print(Fore.YELLOW + Style.BRIGHT + "Ignoring: " + str(spawn) + Style.RESET_ALL)
+        #     try:
+        #         self._device.resume(pid)
+        #     except:
+        #         pass
+        #     return
+
+        # self._selected_spawn = child
+
+        self._print(Fore.GREEN + Style.BRIGHT + "Handling child: " + str(cs) + Style.RESET_ALL)
+        try:
+            ses = self._device.attach(child.pid, realm=self._realm)
+            ses.enable_child_gating()
+            self._child_sessions.add(ses)
+            self._reactor.schedule(lambda: self._on_child_handled(child))
+        except Exception as e:
+            error = e
+            self._reactor.schedule(lambda: self._on_child_unhandled(child, error))
+
+    def _on_child_handled(self, child):
+        self._device.resume(child.pid)
+        pass
+        # raise NotImplementedError
+        # self._spawned_pid = spawn.pid
+        # self._start()
+        # self._started = True
+
+    def _on_child_unhandled(self, child, error):
+        self._update_status("Failed to handle child: %s" % error)
         self._exit(1)
 
     def _on_output(self, pid, fd, data):
