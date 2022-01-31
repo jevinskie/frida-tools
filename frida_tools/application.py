@@ -87,8 +87,10 @@ class ChildSummary:
         self.origin = child.origin
         self.path = child.path
         self.argv = child.argv
+        self.orig_id = id(child)
 
     def __rich_repr__(self):
+        yield "orig_id:", self.orig_id
         yield "pid:", self.pid
         yield "parent_pid:", self.parent_pid
         yield "origin:", self.origin
@@ -240,7 +242,7 @@ class ConsoleApplication(object):
             self._enable_debugger = False
             self._squelch_crash = False
             self._child_gated_target = None
-        self._child_sessions = set()
+        self._child_sessions = {}
         self._schedule_on_session_detached = lambda reason, crash: self._reactor.schedule(lambda: self._on_session_detached(reason, crash))
         self._started = False
         self._resumed = False
@@ -432,8 +434,9 @@ class ConsoleApplication(object):
                     self._spawned_pid = None
                     self._spawned_argv = None
                     self._device.on('child-added', self._on_child_added)
+                    self._device.on('child-removed', self._on_child_removed)
                     ses = self._device.attach(attach_target, realm=self._realm)
-                    self._child_sessions.add(ses)
+                    self._child_sessions[attach_target] = ses
                     try:
                         ses.enable_child_gating()
                     except Exception as e:
@@ -530,23 +533,24 @@ class ConsoleApplication(object):
         print("_handle_child: ", cs)
         # rinspect(child)
         pid = child.pid
-
-        # pattern = self._target[1]
-        # if pattern.match(spawn.identifier) is None or self._selected_spawn is not None:
-        #     self._print(Fore.YELLOW + Style.BRIGHT + "Ignoring: " + str(spawn) + Style.RESET_ALL)
-        #     try:
-        #         self._device.resume(pid)
-        #     except:
-        #         pass
-        #     return
-
-        # self._selected_spawn = child
-
         self._print(Fore.GREEN + Style.BRIGHT + "Handling child: " + str(cs) + Style.RESET_ALL)
+
+        if child.path is not None and child.argv is not None and \
+                self._child_gated_target.match(' '.join([child.path, *child.argv[1:]])):
+            self._spawned_pid = child.pid
+            self._spawned_argv = child.argv
+            try:
+                self._attach(child.pid)
+            except Exception as e:
+                self._update_status("Failed to attach: %s" % e)
+                self._exit(1)
+            self._start()
+            self._started = True
+            return
         try:
             ses = self._device.attach(child.pid, realm=self._realm)
             ses.enable_child_gating()
-            self._child_sessions.add(ses)
+            self._child_sessions[child.pid] = ses
             self._reactor.schedule(lambda: self._on_child_handled(child))
         except Exception as e:
             error = e
@@ -563,6 +567,10 @@ class ConsoleApplication(object):
     def _on_child_unhandled(self, child, error):
         self._update_status("Failed to handle child: %s" % error)
         self._exit(1)
+
+    def _on_child_removed(self, child):
+        cs = ChildSummary(child)
+        print("_child_removed", cs)
 
     def _on_output(self, pid, fd, data):
         if pid != self._target_pid or data is None:
