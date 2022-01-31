@@ -3,6 +3,7 @@ from __future__ import unicode_literals, print_function
 
 import binascii
 import codecs
+import hashlib
 import os
 import platform
 import re
@@ -637,6 +638,7 @@ class FileRepository(Repository):
             if not os.path.isdir(handler_dir):
                 os.makedirs(handler_dir)
             with codecs.open(handler_file, 'w', 'utf-8') as f:
+                f.write(f"// original sha1 hash of following lines: {hashlib.sha1(handler.encode('utf-8')).digest().hex()}\n")
                 f.write(handler)
             self._notify_create(target, handler, handler_file)
 
