@@ -31,6 +31,7 @@ def main():
     from pygments.token import Token
 
     from frida_tools.application import ConsoleApplication
+    from frida_tools import _repl_magic
 
     class REPLApplication(ConsoleApplication):
         def __init__(self):
@@ -38,11 +39,12 @@ def main():
             self._ready = threading.Event()
             self._stopping = threading.Event()
             self._errors = 0
-            config_dir = self._get_or_create_config_dir()
             self._completer = FridaCompleter(self)
             self._cli = None
             self._last_change_id = 0
             self._monitored_files = {}
+            self._autoperform = False
+            self._autoperform_option = False
 
             super(REPLApplication, self).__init__(self._process_input, self._on_stop)
 
@@ -51,7 +53,7 @@ def main():
                     ("completion-menu", "bg:#3d3d3d #ef6456"),
                     ("completion-menu.completion.current", "bg:#ef6456 #3d3d3d"),
                 ])
-                history = FileHistory(os.path.join(config_dir, 'history'))
+                history = FileHistory(self._get_or_create_history_file())
                 self._cli = PromptSession(lexer=PygmentsLexer(JavascriptLexer),
                                           style=style,
                                           history=history,
@@ -68,35 +70,24 @@ def main():
                 self._rpc_complete_server = start_completion_thread(self)
 
         def _add_options(self, parser):
-            parser.add_option("-l", "--load", help="load SCRIPT", metavar="SCRIPT",
-                              type='string', action='store', dest="user_script", default=None)
-            parser.add_option("-P", "--parameters", help="parameters as JSON, same as Gadget", metavar="PARAMETERS_JSON",
-                              type='string', action='store', dest="user_parameters", default=None)
-            parser.add_option("-C", "--cmodule", help="load CMODULE", metavar="CMODULE",
-                              type='string', action='store', dest="user_cmodule", default=None)
-            parser.add_option("--toolchain", help="CModule toolchain to use when compiling from source code",
-                              metavar="any|internal|external", type='choice', choices=['any', 'internal', 'external'], default='any')
-            parser.add_option("-c", "--codeshare", help="load CODESHARE_URI", metavar="CODESHARE_URI",
-                              type='string', action='store', dest="codeshare_uri", default=None)
-            parser.add_option("-e", "--eval", help="evaluate CODE", metavar="CODE",
-                              type='string', action='append', dest="eval_items", default=None)
-            parser.add_option("-q", help="quiet mode (no prompt) and quit after -l and -e",
-                              action='store_true', dest="quiet", default=False)
-            parser.add_option("--no-pause", help="automatically start main thread after startup",
-                              action='store_true', dest="no_pause", default=False)
-            parser.add_option("-o", "--output", help="output to log file", dest="logfile", default=None)
-            parser.add_option("--eternalize", help="eternalize the script before exit",
-                              action='store_true', dest="eternalize", default=False)
-            parser.add_option("--exit-on-error", help="exit with code 1 after encountering any exception in the SCRIPT",
-                              action='store_true', dest="exit_on_error", default=False)
+            parser.add_argument("-l", "--load", help="load SCRIPT", metavar="SCRIPT", dest="user_scripts", action="append", default=[])
+            parser.add_argument("-P", "--parameters", help="parameters as JSON, same as Gadget", metavar="PARAMETERS_JSON", dest="user_parameters")
+            parser.add_argument("-C", "--cmodule", help="load CMODULE", dest="user_cmodule")
+            parser.add_argument("--toolchain", help="CModule toolchain to use when compiling from source code", choices=['any', 'internal', 'external'], default='any')
+            parser.add_argument("-c", "--codeshare", help="load CODESHARE_URI", metavar="CODESHARE_URI", dest="codeshare_uri")
+            parser.add_argument("-e", "--eval", help="evaluate CODE", metavar="CODE", action='append', dest="eval_items")
+            parser.add_argument("-q", help="quiet mode (no prompt) and quit after -l and -e", action='store_true', dest="quiet", default=False)
+            parser.add_argument("--no-pause", help="automatically start main thread after startup", action='store_true', dest="no_pause", default=False)
+            parser.add_argument("-o", "--output", help="output to log file", dest="logfile")
+            parser.add_argument("--eternalize", help="eternalize the script before exit", action='store_true', dest="eternalize", default=False)
+            parser.add_argument("--exit-on-error", help="exit with code 1 after encountering any exception in the SCRIPT", action='store_true', dest="exit_on_error", default=False)
+            parser.add_argument("--auto-perform", help="wrap entered code with Java.perform", action='store_true', dest="autoperform", default=False)
 
         def _initialize(self, parser, options, args):
-            if options.user_script is not None:
-                self._user_script = os.path.abspath(options.user_script)
-                with codecs.open(self._user_script, 'rb', 'utf-8') as f:
+            self._user_scripts = list(map(os.path.abspath, options.user_scripts))
+            for user_script in self._user_scripts:
+                with codecs.open(user_script, 'rb', 'utf-8'):
                     pass
-            else:
-                self._user_script = None
 
             if options.user_parameters is not None:
                 try:
@@ -126,6 +117,7 @@ def main():
             self._no_pause = options.no_pause
             self._eternalize = options.eternalize
             self._exit_on_error = options.exit_on_error
+            self._autoperform_option = options.autoperform
 
             if options.logfile is not None:
                 self._logfile = codecs.open(options.logfile, 'w', 'utf-8')
@@ -138,13 +130,14 @@ def main():
                 self._logfile.write(text + "\n")
 
         def _usage(self):
-            return "usage: %prog [options] target"
+            return "%(prog)s [options] target"
 
         def _needs_target(self):
             return True
 
         def _start(self):
-            self._prompt_string = self._create_prompt()
+            self._set_autoperform(self._autoperform_option)
+            self._refresh_prompt()
 
             if self._codeshare_uri is not None:
                 self._codeshare_script = self._load_codeshare_script(self._codeshare_uri)
@@ -200,10 +193,10 @@ def main():
         def _load_script(self):
             self._monitor_all()
 
-            if self._user_script is not None:
-                name, ext = os.path.splitext(os.path.basename(self._user_script))
-            else:
+            if len(self._user_scripts) == 0:
                 name = "repl"
+            else:
+                name = "+".join(map(self._get_script_name, self._user_scripts))
 
             is_first_load = self._script is None
 
@@ -234,6 +227,9 @@ def main():
             except:
                 pass
 
+        def _get_script_name(self, path):
+            return os.path.splitext(os.path.basename(path))[0]
+
         def _eternalize_script(self):
             if self._script is None:
                 return
@@ -255,7 +251,7 @@ def main():
             self._script = None
 
         def _monitor_all(self):
-            for path in [self._user_script, self._user_cmodule]:
+            for path in self._user_scripts + [self._user_cmodule]:
                 self._monitor(path)
 
         def _demonitor_all(self):
@@ -338,7 +334,7 @@ def main():
                     except frida.InvalidOperationError:
                         return
                 elif expression == "help":
-                    self._print("Help: #TODO :)")
+                    self._do_magic("help")
                 elif expression in ("exit", "quit", "q"):
                     return
                 else:
@@ -346,6 +342,8 @@ def main():
                         if expression.startswith("%"):
                             self._do_magic(expression[1:].rstrip())
                         else:
+                            if self._autoperform:
+                                expression = "Java.performNow(() => { return %s\n/**/ });" % expression
                             if not self._eval_and_print(expression):
                                 self._errors += 1
                     except frida.OperationCancelledError:
@@ -429,11 +427,13 @@ def main():
 
         # Negative means at least abs(val) - 1
         _magic_command_args = {
-            'resume': 0,
-            'load': 1,
-            'reload': 0,
-            'unload': 0,
-            'time': -2  # At least 1 arg
+            'resume': _repl_magic.Resume(),
+            'reload': _repl_magic.Reload(),
+            'unload': _repl_magic.Unload(),
+            'autoperform': _repl_magic.Autoperform(),
+            'exec': _repl_magic.Exec(),
+            'time': _repl_magic.Time(),
+            'help': _repl_magic.Help()
         }
 
         def _do_magic(self, statement):
@@ -441,13 +441,13 @@ def main():
             command = tokens[0]
             args = tokens[1:]
 
-            required_args = self._magic_command_args.get(command)
-
-            if required_args == None:
+            magic_command = self._magic_command_args.get(command)
+            if magic_command == None:
                 self._print("Unknown command: {}".format(command))
                 self._print("Valid commands: {}".format(", ".join(self._magic_command_args.keys())))
                 return
 
+            required_args = magic_command.required_args_count
             atleast_args = False
             if required_args < 0:
                 atleast_args = True
@@ -460,27 +460,28 @@ def main():
                     s='' if required_args == 1 else ' '))
                 return
 
-            if command == 'resume':
-                self._reactor.schedule(lambda: self._resume())
-            elif command == 'reload':
-                self._reload()
-            elif command == 'time':
-                self._eval_and_print('''
-                    (() => {{
-                        const _startTime = Date.now();
-                        const _result = eval({expression});
-                        const _endTime = Date.now();
-                        console.log('Time: ' + (_endTime - _startTime) + ' ms.');
-                        return _result;
-                    }})();'''.format(expression=json.dumps(" ".join(args))))
+            magic_command.execute(self, args)
 
-        def _reload(self):
-            try:
-                self._perform_on_reactor_thread(lambda: self._load_script())
-                return True
-            except Exception as e:
-                self._print("Failed to load script: {}".format(e))
-                return False
+        def _autoperform_command(self, state_argument):
+            if state_argument not in ("on", "off"):
+                self._print("autoperform only accepts on and off as parameters")
+                return
+            self._set_autoperform(state_argument == "on")
+
+        def _set_autoperform(self, state):
+            if self._is_java_available():
+                self._autoperform = state
+                self._refresh_prompt()
+            elif state:
+                self._print("autoperform is only available in Java processes")
+
+        def _is_java_available(self):
+            script = self._session.create_script(name="java_check", source="rpc.exports.javaAvailable = () => Java.available;", runtime=self._runtime)
+            script.load()
+            return script.exports.java_available()
+
+        def _refresh_prompt(self):
+            self._prompt_string = self._create_prompt()
 
         def _create_prompt(self):
             device_type = self._device.type
@@ -495,10 +496,14 @@ def main():
             else:
                 target = self._target[1]
 
+            suffix = ""
+            if self._autoperform:
+                suffix = "(ap)"
+
             if device_type in ('local', 'remote'):
-                prompt_string = "%s::%s" % (device_type.title(), target)
+                prompt_string = "%s::%s %s" % (device_type.title(), target, suffix)
             else:
-                prompt_string = "%s::%s" % (self._device.name, target)
+                prompt_string = "%s::%s %s" % (self._device.name, target, suffix)
 
             return prompt_string
 
@@ -540,24 +545,28 @@ def main():
                 self._print("Failed to load script: {error}".format(error=e))
 
         def _create_repl_script(self):
-            user_script = ""
+            generated_script = ""
 
             if self._codeshare_script is not None:
-                user_script = self._codeshare_script
+                generated_script = self._codeshare_script
 
-            if self._user_script is not None:
-                with codecs.open(self._user_script, 'rb', 'utf-8') as f:
-                    user_script += f.read()
+            for user_script in self._user_scripts:
+                with codecs.open(user_script, 'rb', 'utf-8') as f:
+                    generated_script += f.read()
+                    generated_script += '\n'
 
-            if len(user_script) == 0:
+            if len(generated_script) == 0:
                 return "(function () {\n" + self._make_repl_runtime(indent=4) + "\n})();"
 
-            if user_script.startswith("📦\n"):
+            if generated_script.startswith("📦\n"):
                 runtime = self._make_repl_runtime(indent=0)
                 raw_runtime = runtime.encode("utf-8")
-                return "📦\n{} /frida/repl.js\n✄\n{}\n✄\n{}".format(len(raw_runtime), runtime, user_script[2:])
+                return "📦\n{} /frida/repl.js\n✄\n{}\n✄\n{}".format(len(raw_runtime), runtime, generated_script[2:])
             else:
-                return "_init();" + user_script + """\n\n// Frida REPL script:\n\
+                return self._wrap_script_in_repl_runtime(generated_script)
+
+        def _wrap_script_in_repl_runtime(self, script):
+                return "_init();" + script + """\n\n// Frida REPL script:\n\
 
 function _init() {
     """ + self._make_repl_runtime(indent=4) + """
@@ -713,30 +722,17 @@ URL: {url}
                     })
                     return script
 
-        def _get_or_create_config_dir(self):
-            xdg_home = os.getenv("XDG_CONFIG_HOME")
-            if xdg_home is not None:
-                config_dir = os.path.join(xdg_home, "frida")
-            else:
-                config_dir = os.path.join(os.path.expanduser("~"), ".frida")
-            if not os.path.exists(config_dir):
-                os.makedirs(config_dir)
-            return config_dir
-
         def _update_truststore(self, record):
             trust_store = self._get_or_create_truststore()
             trust_store.update(record)
 
-            config_dir = self._get_or_create_config_dir()
-            codeshare_trust_store = os.path.join(config_dir, "codeshare-truststore.json")
+            codeshare_trust_store = self._get_or_create_truststore_file()
 
             with open(codeshare_trust_store, 'w') as f:
                 f.write(json.dumps(trust_store))
 
         def _get_or_create_truststore(self):
-            config_dir = self._get_or_create_config_dir()
-
-            codeshare_trust_store = os.path.join(config_dir, "codeshare-truststore.json")
+            codeshare_trust_store = self._get_or_create_truststore_file()
 
             if os.path.exists(codeshare_trust_store):
                 try:
@@ -753,6 +749,43 @@ URL: {url}
                 trust_store = {}
 
             return trust_store
+
+        def _get_or_create_truststore_file(self):
+            truststore_file = os.path.join(self._get_or_create_data_dir(), 'codeshare-truststore.json')
+            if not os.path.isfile(truststore_file):
+                self._migrate_old_config_file('codeshare-truststore.json', truststore_file)
+            return truststore_file
+
+        def _get_or_create_history_file(self):
+            history_file = os.path.join(self._get_or_create_state_dir(), 'history')
+            if os.path.isfile(history_file):
+                return history_file
+
+            found_old = self._migrate_old_config_file('history', history_file)
+            if not found_old:
+                open(history_file, 'a').close()
+
+            return history_file
+
+        def _migrate_old_config_file(self, name, new_path):
+            xdg_config_home = os.getenv("XDG_CONFIG_HOME")
+            if xdg_config_home is not None:
+                old_file = os.path.exists(os.path.join(xdg_config_home, 'frida', name))
+                if os.path.isfile(old_file):
+                    os.rename(old_file, new_path)
+                    return True
+
+            old_file = os.path.join(os.path.expanduser('~'), '.frida', name)
+            if os.path.isfile(old_file):
+                os.rename(old_file, new_path)
+                return True
+
+            return False
+
+        def _on_device_found(self):
+            self._print("""\
+   . . . .
+   . . . .   Connected to {device_name} (id={device_id})""".format(device_id=self._device.id, device_name=self._device.name))
 
     class FridaCompleter(Completer):
         def __init__(self, repl):
