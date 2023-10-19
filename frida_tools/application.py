@@ -662,6 +662,8 @@ class ConsoleApplication:
         self._report_exceptions_script = script
         script.on("message", self._on_report_exceptions_message)
         script.load()
+        if not script.exports_sync.init():
+            raise Exception("Couldn't get init from report-exceptions's agent")
         print("loaded report-exceptions script!!")
 
     def _on_sigterm(self, n: int, f: Optional[FrameType]) -> None:
