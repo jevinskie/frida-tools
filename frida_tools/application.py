@@ -232,6 +232,8 @@ class ConsoleApplication:
             self._runtime = "qjs"
             self._enable_debugger = False
             self._squelch_crash = False
+        self._report_exceptions = options.report_exceptions
+        self._report_exceptions_script = None
 
     def _initialize_target(self, parser: argparse.ArgumentParser, options: argparse.Namespace) -> None:
         if self._needs_target():
@@ -382,6 +384,12 @@ class ConsoleApplication:
             action="store_true",
             default=False,
         )
+        parser.add_argument(
+            "--report-exceptions",
+            help="if enabled, will report exceptions with a backtrace",
+            action="store_true",
+            default=False
+        )
         parser.add_argument("args", help="extra arguments and/or target", nargs="*")
 
     def run(self) -> None:
@@ -395,7 +403,12 @@ class ConsoleApplication:
 
         signal.signal(signal.SIGTERM, self._on_sigterm)
 
+        print("pre-run")
+
+
+
         self._reactor.run()
+        print("post-run")
 
         if self._started:
             try:
@@ -605,6 +618,9 @@ class ConsoleApplication:
         assert self._device is not None
         self._session = self._device.attach(pid, realm=self._realm)
         self._session.on("detached", self._schedule_on_session_detached)
+        if self._report_exceptions:
+            self._install_exception_reporting()
+
 
         if self._session_transport == "p2p":
             peer_options = {}
@@ -622,6 +638,31 @@ class ConsoleApplication:
     def _show_message_if_no_device(self) -> None:
         if self._device is None:
             self._print("Waiting for USB device to appear...")
+
+    def _on_report_exceptions_message(self, message, data) -> None:
+        from rich import print as rprint
+        print("_on_report_exceptions_message")
+        rprint(f"message: {message}")
+        if message["type"] != "send" or "frida:exception" not in message["payload"].keys():
+            return
+        print("_on_report_exceptions_message is our guy")
+        details = message["payload"]["frida:exception"]["details"]
+        backtrace = message["payload"]["frida:exception"]["backtrace"]
+        rprint(f"details: {details}")
+        rprint(f"backtrace: {backtrace}")
+        self._report_exceptions_script.post({"type": "frida:exception-ack"})
+        print("_on_report_exceptions_message posted ack")
+
+    def _install_exception_reporting(self) -> None:
+        print("_install_exception_reporting")
+        data_dir = os.path.dirname(__file__)
+        with codecs.open(os.path.join(data_dir, "report_exceptions_agent.js"), "r", "utf-8") as f:
+            source = f.read()
+        script = self._session.create_script(name="report-exceptions", source=source, runtime=self._runtime)
+        self._report_exceptions_script = script
+        script.on("message", self._on_report_exceptions_message)
+        script.load()
+        print("loaded report-exceptions script!!")
 
     def _on_sigterm(self, n: int, f: Optional[FrameType]) -> None:
         self._reactor.cancel_io()
@@ -658,6 +699,7 @@ class ConsoleApplication:
 
     def _on_spawn_handled(self, spawn: _frida.Spawn) -> None:
         self._spawned_pid = spawn.pid
+        self._pre_start()
         self._start()
         self._started = True
 
