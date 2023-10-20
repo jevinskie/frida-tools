@@ -392,13 +392,13 @@ class ConsoleApplication:
             "--report-exceptions",
             help="if enabled, will report exceptions with a backtrace",
             action="store_true",
-            default=False
+            default=False,
         )
         parser.add_argument(
             "--report-exceptions-no-backtrace",
             help="requires --report-exceptions. if enabled, will suppress backtrace generation on exceptions (backtrace generation can sometime deadlock)",
             action="store_true",
-            default=False
+            default=False,
         )
         parser.add_argument("args", help="extra arguments and/or target", nargs="*")
 
@@ -414,8 +414,6 @@ class ConsoleApplication:
         signal.signal(signal.SIGTERM, self._on_sigterm)
 
         print("pre-run")
-
-
 
         self._reactor.run()
         print("post-run")
@@ -631,7 +629,6 @@ class ConsoleApplication:
         if self._report_exceptions:
             self._install_exception_reporting()
 
-
         if self._session_transport == "p2p":
             peer_options = {}
             if self._stun_server is not None:
@@ -651,6 +648,7 @@ class ConsoleApplication:
 
     def _on_report_exceptions_message(self, message, data) -> None:
         from rich import print as rprint
+
         print("_on_report_exceptions_message")
         rprint(f"message: {message}")
         msg_types = set(("frida:exception-details", "frida:exception-backtrac"))
