@@ -1,45 +1,35 @@
-var yield_name: string;
-var yield_module: string;
-var yield_res_type: NativeFunctionReturnType;
-let platform = Process.platform;
-if (platform == 'windows') {
-    yield_name = 'SwitchToThread';
-    yield_module = 'Kernel32.dll';
-    yield_res_type = 'bool';
-} else {
-    yield_name = 'sched_yield';
-    yield_res_type = 'int';
-    if (platform == 'darwin') {
-        yield_module = '/usr/lib/system/libsystem_pthread.dylib';
-    } else {
-        yield_module = 'libc.so';
-    }  
-}
-let yield_addr = Module.getExportByName(yield_module, yield_name);
-let yield_native = new NativeFunction(yield_addr, yield_res_type, []);
+var should_fetch_backtrace: boolean = true;
+var exception_id: number = 0;
 
-function exception_handler(details: ExceptionDetails): boolean {
-    console.log('report-exceptions script got exception from JS');
-    // let backtrace = Thread.backtrace(details.context, Backtracer.ACCURATE).map(DebugSymbol.fromAddress);
-    let backtrace = "<empty backtrace>";
-    send({'frida:exception': {'details': details, 'backtrace': backtrace}});
-    var ack: boolean = false;
-    while (!ack) {
-        recv('frida:exception-ack', function (message, data) {
-            ack = true;
+Process.setExceptionHandler(function (details) {
+    console.log(`report-exceptions script got exception from JS. id: %${exception_id}`);
+    send({'frida:exception-details': {'details': details, 'exception-id': exception_id}});
+    var details_ack: boolean = false;
+    while (!details_ack) {
+        recv('frida:exception-details-ack', function (message, data) {
+            details_ack = true;
         });
-        let yield_res = yield_native();
-        if (yield_res) {
-            throw new Error(`yield_native returned non-zero value: ${yield_res}`);
+        Thread.sleep(0.000001); // Otherwise recv deadlocks. 1 us, works for g_usleep() on windows (Sleep(1)) and nanosleep elsewhere
+    }
+    if (should_fetch_backtrace) {
+        console.log(`report-exceptions script sending backtrace details. id: ${exception_id}`);
+        // let backtrace = Thread.backtrace(details.context, Backtracer.ACCURATE).map(DebugSymbol.fromAddress);
+        let backtrace = ["<empty backtrace>"];
+        send({'frida:exception-backtrace': {'backtrace': backtrace, 'exception-id': exception_id}});
+        var backtrace_ack: boolean = false;
+        while (!backtrace_ack) {
+            recv('frida:exception-backtrace-ack', function (message, data) {
+                backtrace_ack = true;
+            });
+            Thread.sleep(0.000001);
         }
     }
+    ++exception_id;
     return false;
-}
-
-Process.setExceptionHandler(exception_handler);
+});
 
 rpc.exports = {
-    init() {
-        return true;
+    fetch_backtrace(enabled: boolean) {
+        should_fetch_backtrace = enabled;
     }
 };
