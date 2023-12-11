@@ -2,6 +2,16 @@
 #include <iostream>
 #include <type_traits>
 
+struct ObjCTypeKind {
+    bool objc;
+    bool objc_ptr;
+    bool objc_attributed;
+    CXType type;
+    bool is_objc() const {
+        return objc || objc_ptr || objc_attributed;
+    }
+};
+
 template <typename E> constexpr auto to_integral(E e) -> typename std::underlying_type<E>::type {
     return static_cast<typename std::underlying_type<E>::type>(e);
 }
@@ -12,8 +22,10 @@ CXChildVisitResult attr_visitor(CXCursor cursor, CXCursor parent, CXClientData c
     CXCursorKind kind = clang_getCursorKind(cursor);
     std::cout << "- attr_visitor kind: " << clang_getCString(clang_getCursorKindSpelling(kind))
               << " aka " << to_integral(kind) << std::endl;
-    if (kind == CXCursor_ObjCBridgeAttr || kind == CXCursor_ObjCBridgeMutableAttr || kind == CXCursor_ObjCBridgeRelatedAttr) {
-        *(bool *)client_data = true;
+    if (kind == CXCursor_ObjCBridgeAttr || kind == CXCursor_ObjCBridgeMutableAttr ||
+        kind == CXCursor_ObjCBridgeRelatedAttr) {
+        *(ObjCTypeKind *)client_data = {.objc_attributed = true,
+                                        .type            = clang_getCursorType(cursor)};
         return CXChildVisit_Break;
     }
     CXType type = clang_getCursorType(cursor);
@@ -26,18 +38,28 @@ CXChildVisitResult attr_visitor(CXCursor cursor, CXCursor parent, CXClientData c
     return CXChildVisit_Recurse;
 }
 
-bool is_objc_object_or_class(CXType type, CXCursor cursor) {
+ObjCTypeKind is_objc_object_or_class(CXType type, CXCursor cursor, bool pointer = false) {
     if (type.kind == CXType_ObjCObject || type.kind == CXType_ObjCId ||
         type.kind == CXType_ObjCInterface || type.kind == CXType_ObjCClass) {
-        return true;
+        if (!pointer) {
+            return ObjCTypeKind{.objc = true, .type = type};
+        } else {
+            return ObjCTypeKind{.objc_ptr = true, .type = type};
+        }
+    }
+    if (type.kind == CXType_ObjCObjectPointer) {
+        return ObjCTypeKind{.objc_ptr = true, .type = type};
     }
     // Check for attributed types too
     if (type.kind == CXType_Attributed) {
         CXType attributedType = clang_Type_getModifiedType(type);
         std::cout << "- attributed: " << clang_getCString(clang_getTypeSpelling(attributedType))
                   << " aka " << to_integral(attributedType.kind) << std::endl;
-        clang_visitChildren(cursor, attr_visitor, nullptr);
-        return is_objc_object_or_class(attributedType, cursor);
+        // clang_visitChildren(cursor, attr_visitor, nullptr);
+        const auto objc_kind = is_objc_object_or_class(attributedType, cursor);
+        if (objc_kind.is_objc()) {
+            return objc_kind;
+        }
     }
     // Check for attributed cursors too
     if (clang_Cursor_hasAttrs(cursor)) {
@@ -45,10 +67,10 @@ bool is_objc_object_or_class(CXType type, CXCursor cursor) {
         std::cout << "attributed cursor: " << clang_getCString(clang_getCursorDisplayName(cursor))
                   << " kind: " << clang_getCString(clang_getCursorKindSpelling(kind))
                   << " num: " << clang_Cursor_hasAttrs(cursor) << std::endl;
-        bool objc_attributed = false;
-        clang_visitChildren(cursor, attr_visitor, &objc_attributed);
-        if (objc_attributed) {
-            return true;
+        ObjCTypeKind objc_kind{};
+        clang_visitChildren(cursor, attr_visitor, &objc_kind);
+        if (objc_kind.objc_attributed) {
+            return objc_kind;
         }
     }
     // Check for pointer types too
@@ -56,21 +78,34 @@ bool is_objc_object_or_class(CXType type, CXCursor cursor) {
         CXType pointeeType = clang_getPointeeType(type);
         std::cout << "- pointee: " << clang_getCString(clang_getTypeSpelling(pointeeType))
                   << " aka " << to_integral(pointeeType.kind) << std::endl;
-        return is_objc_object_or_class(pointeeType, cursor);
+        // return is_objc_object_or_class(pointeeType, cursor)
+        const auto objc_kind = is_objc_object_or_class(pointeeType, cursor, true);
+        if (objc_kind.is_objc()) {
+            // return ObjCTypeKind{.objc_ptr = true, .type = pointeeType};
+            return objc_kind;
+        }
     }
     // Check for elaborated types too
     if (type.kind == CXType_Elaborated) {
         CXType namedType = clang_Type_getNamedType(type);
         std::cout << "- elaborated: " << clang_getCString(clang_getTypeSpelling(namedType))
                   << " aka " << to_integral(namedType.kind) << std::endl;
-        return is_objc_object_or_class(namedType, cursor);
+        // return is_objc_object_or_class(namedType, cursor);
+        const auto objc_kind = is_objc_object_or_class(namedType, cursor);
+        if (objc_kind.is_objc()) {
+            return objc_kind;
+        }
     }
     // Check for canonical types too
     if (type.kind == CXType_Typedef) {
         CXType canonicalType = clang_getCanonicalType(type);
         std::cout << "- canonical: " << clang_getCString(clang_getTypeSpelling(canonicalType))
                   << " aka " << to_integral(canonicalType.kind) << std::endl;
-        return is_objc_object_or_class(canonicalType, cursor);
+        // return is_objc_object_or_class(canonicalType, cursor);
+        const auto objc_kind = is_objc_object_or_class(canonicalType, cursor);
+        if (objc_kind.is_objc()) {
+            return objc_kind;
+        }
     }
     // Check for record types too
     if (type.kind == CXType_Record) {
@@ -84,9 +119,13 @@ bool is_objc_object_or_class(CXType type, CXCursor cursor) {
         CXType recordType = clang_getCanonicalType(type);
         std::cout << "- record: " << clang_getCString(clang_getTypeSpelling(recordType)) << " aka "
                   << to_integral(recordType.kind) << std::endl;
-        return is_objc_object_or_class(recordType, declCursor);
+        // return is_objc_object_or_class(recordType, declCursor);
+        const auto objc_kind = is_objc_object_or_class(recordType, declCursor);
+        if (objc_kind.is_objc()) {
+            return objc_kind;
+        }
     }
-    return false;
+    return ObjCTypeKind{};
 }
 
 bool is_objc_selector(CXType type) {
@@ -116,9 +155,23 @@ CXChildVisitResult function_visitor(CXCursor cursor, CXCursor parent, CXClientDa
                       << clang_getCString(clang_getTypeSpelling(argType)) << " aka "
                       << to_integral(argType.kind) << std::endl;
 
-            if (is_objc_object_or_class(argType, cursor)) {
-                std::cout << "- Parameter " << i
-                          << " is an ObjC object or class (or a pointer to one)." << std::endl;
+            if (const auto objc_kind = is_objc_object_or_class(argType, cursor);
+                objc_kind.is_objc()) {
+                std::cout << "-! Parameter " << i << " is an ObjC ";
+                if (objc_kind.objc) {
+                    std::cout << "object of type "
+                              << clang_getCString(clang_getTypeSpelling(objc_kind.type))
+                              << std::endl;
+                } else if (objc_kind.objc_ptr) {
+                    std::cout << "pointer object of type "
+                              << clang_getCString(clang_getTypeSpelling(objc_kind.type))
+                              << std::endl;
+                } else if (objc_kind.objc_attributed) {
+                    CXType objcAttributedType = clang_getCursorType(cursor);
+                    std::cout << "pointer object of type "
+                              << clang_getCString(clang_getTypeSpelling(objc_kind.type))
+                              << std::endl;
+                }
             }
 
             if (is_objc_selector(argType)) {
