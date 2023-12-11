@@ -30,6 +30,4 @@ extern int i_take_opaque_foo(OpaqueFooRef muh_opaque_foo_ref);
 
 extern int i_take_int_v4(int_v4 muh_iv4);
 
-extern int i_take_foo(Foo muh_foo);
-
 extern int i_take_foo_ptr(Foo *muh_foo_ptr);
